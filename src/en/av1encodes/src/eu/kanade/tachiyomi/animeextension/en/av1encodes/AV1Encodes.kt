@@ -599,7 +599,7 @@ class AV1Encodes : Source() {
     override suspend fun getVideoList(episode: SEpisode): List<Video> = extractAllVideos(episode.url).sortVideos()
 
     private suspend fun extractAllVideos(episodeUrl: String): List<Video> {
-        Log.d(TAG, "extractAllVideos: episodeUrl=$episodeUrl")
+        Log.d(TAG, "extractAllVideos: episodeUrl=${episodeUrl.substringBefore("?")}")
 
         val cleanPath = episodeUrl.substringBefore("?")
         val pathSegments = cleanPath.split("/").filter { it.isNotBlank() }
@@ -622,29 +622,30 @@ class AV1Encodes : Source() {
         }
 
         var ddlToken = extractDdlToken(pageHtml)
+        var episodePageHtml: String? = null
+        var episodeItem = findEpisodeItem(pageHtml, episodeUrl)
+        var ddlResponse = episodeItem?.ddl?.takeIf { it.success }
 
-        // If token missing or page blocked/expired, re-fetch fresh download URL from episode list page
-        if (ddlToken == null && slug.isNotBlank() && resSegment.isNotBlank()) {
-            val epPageUrl = "$baseUrl/episodes/$slug/$season/$resSegment"
-            Log.d(TAG, "extractAllVideos: re-fetching fresh token from $epPageUrl")
-            val freshHtml = try {
-                client.newCall(
-                    GET(epPageUrl, headers.newBuilder().set("Referer", "$baseUrl/anime/$slug").build()),
-                ).awaitSuccess().bodyString()
-            } catch (e: Exception) {
-                Log.e(TAG, "extractAllVideos: fresh ep page failed — ${e.message}")
-                ""
-            }
+        // Newer episode-list responses may carry the DDL links directly. Prefer that
+        // payload; otherwise refresh the signed download URL before trying the token API.
+        if (ddlResponse == null && ddlToken.isNullOrBlank() && slug.isNotBlank() && resSegment.isNotBlank()) {
+            episodePageHtml = fetchEpisodePage(slug, season, resSegment)
+            episodeItem = findEpisodeItem(episodePageHtml, episodeUrl)
+            ddlResponse = episodeItem?.ddl?.takeIf { it.success }
 
-            if (freshHtml.isNotBlank() && !freshHtml.contains("Access Blocked")) {
-                val freshLink = Jsoup.parse(freshHtml)
+            if (ddlResponse == null && episodePageHtml.isNotBlank() && !episodePageHtml.contains("Access Blocked", ignoreCase = true)) {
+                val freshLink = episodeItem?.href ?: Jsoup.parse(episodePageHtml)
                     .select("a[href*='/download/']")
-                    .firstOrNull { it.attr("href").contains(encodedFilename) || Uri.decode(it.attr("href")).contains(filename) }
+                    .firstOrNull {
+                        normalizeEpisodePath(it.attr("href")) == normalizeEpisodePath(episodeUrl) ||
+                            it.attr("href").contains(encodedFilename) ||
+                            Uri.decode(it.attr("href")).contains(filename)
+                    }
                     ?.attr("href")
 
                 if (!freshLink.isNullOrBlank()) {
                     downloadPageUrl = if (freshLink.startsWith("http")) freshLink else baseUrl + freshLink
-                    Log.d(TAG, "extractAllVideos: fetched fresh downloadPageUrl=$downloadPageUrl")
+                    Log.d(TAG, "extractAllVideos: refreshed download URL from episode list")
                     pageHtml = try {
                         client.newCall(
                             GET(downloadPageUrl, headers.newBuilder().set("Referer", "$baseUrl/").build()),
@@ -665,58 +666,79 @@ class AV1Encodes : Source() {
             .find(filename)?.groupValues?.get(1) ?: ""
         val audioSuffix = if (audioTag.isNotBlank()) " [$audioTag]" else ""
 
-        if (!ddlToken.isNullOrBlank()) {
-            val ddlUrl = "$baseUrl/get_ddl/$encodedFilename"
-            Log.d(TAG, "extractAllVideos: calling get_ddl → $ddlUrl with token=$ddlToken")
-            val ddlRaw = try {
-                client.newCall(
-                    GET(
-                        ddlUrl,
-                        headers.newBuilder()
-                            .set("Accept", "application/json")
-                            .set("Referer", downloadPageUrl)
-                            .set("Sec-Fetch-Dest", "empty")
-                            .set("Sec-Fetch-Mode", "cors")
-                            .set("Sec-Fetch-Site", "same-origin")
-                            .set("X-DDL-Token", ddlToken)
-                            .build(),
-                    ),
-                ).awaitSuccess().bodyString()
-            } catch (e: Exception) {
-                Log.e(TAG, "extractAllVideos: get_ddl failed — ${e.message}")
-                ""
+        if (ddlResponse == null && !ddlToken.isNullOrBlank()) {
+            ddlResponse = fetchDdlResponse(encodedFilename, ddlToken, downloadPageUrl)
+        }
+
+        // If the token was present but rejected/expired, refresh the episode response
+        // once. This also handles JSON episode responses that embed their own DDL data.
+        if (ddlResponse == null && episodePageHtml == null && slug.isNotBlank() && resSegment.isNotBlank()) {
+            episodePageHtml = fetchEpisodePage(slug, season, resSegment)
+            episodeItem = findEpisodeItem(episodePageHtml, episodeUrl)
+            ddlResponse = episodeItem?.ddl?.takeIf { it.success }
+        }
+
+        if (ddlResponse == null && episodePageHtml != null && episodePageHtml.isNotBlank() &&
+            !episodePageHtml.contains("Access Blocked", ignoreCase = true)
+        ) {
+            val freshLink = episodeItem?.href ?: Jsoup.parse(episodePageHtml)
+                .select("a[href*='/download/']")
+                .firstOrNull {
+                    normalizeEpisodePath(it.attr("href")) == normalizeEpisodePath(episodeUrl) ||
+                        it.attr("href").contains(encodedFilename) ||
+                        Uri.decode(it.attr("href")).contains(filename)
+                }
+                ?.attr("href")
+
+            if (!freshLink.isNullOrBlank()) {
+                val freshDownloadUrl = if (freshLink.startsWith("http")) freshLink else baseUrl + freshLink
+                if (freshDownloadUrl != downloadPageUrl) {
+                    downloadPageUrl = freshDownloadUrl
+                    pageHtml = try {
+                        client.newCall(
+                            GET(downloadPageUrl, headers.newBuilder().set("Referer", "$baseUrl/").build()),
+                        ).awaitSuccess().bodyString()
+                    } catch (e: Exception) {
+                        Log.e(TAG, "extractAllVideos: refreshed download page failed — ${e.message}")
+                        ""
+                    }
+                    ddlToken = extractDdlToken(pageHtml)
+                    if (ddlResponse == null && !ddlToken.isNullOrBlank()) {
+                        ddlResponse = fetchDdlResponse(encodedFilename, ddlToken, downloadPageUrl)
+                    }
+                }
+            }
+        }
+
+        val ddl = ddlResponse?.takeIf { it.success }
+        if (ddl != null) {
+            val sizeLabel = ddl.fileSize?.let { " · $it" } ?: ""
+            val qualLabel = "AV1 · $resLabel$audioSuffix$sizeLabel"
+            val vHeaders = getVideoHeaders()
+
+            val resolvedStream = resolveRedirect(ddl.streamLink)
+            val resolvedWatch = resolveRedirect(ddl.watchLink)
+            val resolvedDl = resolveRedirect(ddl.downloadLink ?: ddl.ddl)
+            val primaryCdnUrl = resolvedStream ?: resolvedWatch ?: resolvedDl
+
+            if (primaryCdnUrl != null) {
+                val dlUrl = toDlUrl(resolvedDl ?: primaryCdnUrl, ext)
+                val streamUrl = toStreamUrl(resolvedStream ?: primaryCdnUrl, ext)
+
+                Log.d(TAG, "extractAllVideos: resolved Direct DL link")
+                videos.add(Video(videoUrl = dlUrl, videoTitle = "$qualLabel · Direct DL", headers = vHeaders))
+
+                Log.d(TAG, "extractAllVideos: resolved Stream link")
+                videos.add(Video(videoUrl = streamUrl, videoTitle = "$qualLabel · Stream", headers = vHeaders))
             }
 
-            val ddl = runCatching { ddlRaw.parseAs<DdlResponse>() }.getOrNull()
-            if (ddl != null && ddl.success) {
-                val sizeLabel = ddl.fileSize?.let { " · $it" } ?: ""
-                val qualLabel = "AV1 · $resLabel$audioSuffix$sizeLabel"
-                val vHeaders = getVideoHeaders()
-
-                val resolvedStream = resolveRedirect(ddl.streamLink)
-                val resolvedWatch = resolveRedirect(ddl.watchLink)
-                val resolvedDl = resolveRedirect(ddl.downloadLink ?: ddl.ddl)
-                val primaryCdnUrl = resolvedStream ?: resolvedWatch ?: resolvedDl
-
-                if (primaryCdnUrl != null) {
-                    val dlUrl = toDlUrl(resolvedDl ?: primaryCdnUrl, ext)
-                    val streamUrl = toStreamUrl(resolvedStream ?: primaryCdnUrl, ext)
-
-                    Log.d(TAG, "extractAllVideos: Direct DL → $dlUrl")
-                    videos.add(Video(videoUrl = dlUrl, videoTitle = "$qualLabel · Direct DL", headers = vHeaders))
-
-                    Log.d(TAG, "extractAllVideos: Stream → $streamUrl")
-                    videos.add(Video(videoUrl = streamUrl, videoTitle = "$qualLabel · Stream", headers = vHeaders))
-                }
-
-                if (preferences.getBoolean(PREF_SHOW_TORRENT_KEY, PREF_SHOW_TORRENT_DEFAULT)) {
-                    val rawTorrent = ddl.torrentLink
-                    if (!rawTorrent.isNullOrBlank()) {
-                        val torrentUrl = if (rawTorrent.startsWith("magnet:")) rawTorrent else resolveRedirect(rawTorrent)
-                        if (torrentUrl != null) {
-                            Log.d(TAG, "extractAllVideos: torrent URL → $torrentUrl")
-                            videos.add(Video(videoUrl = torrentUrl, videoTitle = "$qualLabel · Torrent", headers = vHeaders))
-                        }
+            if (preferences.getBoolean(PREF_SHOW_TORRENT_KEY, PREF_SHOW_TORRENT_DEFAULT)) {
+                val rawTorrent = ddl.torrentLink
+                if (!rawTorrent.isNullOrBlank()) {
+                    val torrentUrl = if (rawTorrent.startsWith("magnet:")) rawTorrent else resolveRedirect(rawTorrent)
+                    if (torrentUrl != null) {
+                        Log.d(TAG, "extractAllVideos: resolved torrent link")
+                        videos.add(Video(videoUrl = torrentUrl, videoTitle = "$qualLabel · Torrent", headers = vHeaders))
                     }
                 }
             }
@@ -752,6 +774,60 @@ class AV1Encodes : Source() {
         return videos
     }
 
+    private suspend fun fetchEpisodePage(slug: String, season: String, resSegment: String): String {
+        val epPageUrl = "$baseUrl/episodes/$slug/$season/$resSegment"
+        Log.d(TAG, "extractAllVideos: refreshing episode data from $epPageUrl")
+        return try {
+            client.newCall(
+                GET(epPageUrl, headers.newBuilder().set("Referer", "$baseUrl/anime/$slug").build()),
+            ).awaitSuccess().bodyString()
+        } catch (e: Exception) {
+            Log.e(TAG, "extractAllVideos: episode data refresh failed — ${e.message}")
+            ""
+        }
+    }
+
+    private suspend fun fetchDdlResponse(encodedFilename: String, token: String, referer: String): DdlResponse? {
+        val ddlUrl = "$baseUrl/get_ddl/$encodedFilename"
+        Log.d(TAG, "extractAllVideos: calling get_ddl (token present)")
+        val ddlRaw = try {
+            client.newCall(
+                GET(
+                    ddlUrl,
+                    headers.newBuilder()
+                        .set("Accept", "application/json")
+                        .set("Referer", referer)
+                        .set("Sec-Fetch-Dest", "empty")
+                        .set("Sec-Fetch-Mode", "cors")
+                        .set("Sec-Fetch-Site", "same-origin")
+                        .set("X-DDL-Token", token)
+                        .build(),
+                ),
+            ).awaitSuccess().bodyString()
+        } catch (e: Exception) {
+            Log.e(TAG, "extractAllVideos: get_ddl failed — ${e.message}")
+            return null
+        }
+        return runCatching { ddlRaw.parseAs<DdlResponse>() }
+            .getOrNull()
+            ?.takeIf { it.success }
+    }
+
+    private fun findEpisodeItem(html: String, episodeUrl: String): EpisodeItem? {
+        val json = html.trim()
+        if (!json.startsWith("[")) return null
+        val items = runCatching { json.parseAs<List<EpisodeItem>>() }.getOrNull() ?: return null
+        val targetPath = normalizeEpisodePath(episodeUrl)
+        return items.firstOrNull { normalizeEpisodePath(it.href) == targetPath }
+    }
+
+    private fun normalizeEpisodePath(url: String): String {
+        val withoutFragment = url.substringBefore("#")
+        val path = runCatching { java.net.URI(withoutFragment).rawPath }.getOrNull()
+            ?: withoutFragment.substringBefore("?")
+        return Uri.decode(path).trimEnd('/')
+    }
+
     private suspend fun resolveRedirect(path: String?, depth: Int = 0): String? {
         if (path.isNullOrBlank() || depth > 3) return null
         val target = if (path.startsWith("/")) "$baseUrl$path" else path
@@ -779,7 +855,7 @@ class AV1Encodes : Source() {
                 }
             }
         } catch (e: Exception) {
-            Log.e(TAG, "resolveRedirect failed for $path: ${e.message}")
+            Log.e(TAG, "resolveRedirect failed for ${path.substringBefore("?")}: ${e.message}")
             null
         }
     }
