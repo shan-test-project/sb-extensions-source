@@ -21,6 +21,7 @@ import keiyoushi.utils.parallelCatchingFlatMapBlocking
 import keiyoushi.utils.parallelMapNotNullBlocking
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.useAsJsoup
+import kotlinx.coroutines.delay
 import okhttp3.Dispatcher
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -30,8 +31,10 @@ import okhttp3.Response
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import java.io.IOException
 import java.net.URLEncoder
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 
 class AV1Encodes : Source() {
 
@@ -73,6 +76,29 @@ class AV1Encodes : Source() {
             .followRedirects(false)
             .followSslRedirects(false)
             .build()
+    }
+
+    private data class CachedVideos(val cachedAt: Long, val videos: List<Video>)
+    private val videoCache = ConcurrentHashMap<String, CachedVideos>()
+
+    private suspend fun getCachedVideos(episodeUrl: String): List<Video> {
+        val key = normalizeEpisodePath(episodeUrl)
+        val now = System.currentTimeMillis()
+        videoCache[key]?.let { cached ->
+            if (now - cached.cachedAt < VIDEO_CACHE_TTL_MS) return cached.videos
+            videoCache.remove(key, cached)
+        }
+
+        val videos = extractAllVideos(episodeUrl)
+        if (videos.isNotEmpty()) {
+            if (videoCache.size >= MAX_VIDEO_CACHE_SIZE) {
+                videoCache.entries.minByOrNull { it.value.cachedAt }?.let { oldest ->
+                    videoCache.remove(oldest.key, oldest.value)
+                }
+            }
+            videoCache[key] = CachedVideos(System.currentTimeMillis(), videos)
+        }
+        return videos
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -576,14 +602,13 @@ class AV1Encodes : Source() {
     // ══════════════════════════════════════════════════════════════════════════
 
     override suspend fun getHosterList(episode: SEpisode): List<Hoster> {
-        val hosters = mutableListOf<Hoster>()
-        hosters.add(Hoster(hosterName = "Stream", hosterUrl = "${episode.url}#server=Stream"))
-        hosters.add(Hoster(hosterName = "Dash", hosterUrl = "${episode.url}#server=Dash"))
-        hosters.add(Hoster(hosterName = "Direct DL", hosterUrl = "${episode.url}#server=Direct DL"))
-        if (preferences.getBoolean(PREF_SHOW_TORRENT_KEY, PREF_SHOW_TORRENT_DEFAULT)) {
-            hosters.add(Hoster(hosterName = "Torrent", hosterUrl = "${episode.url}#server=Torrent"))
-        }
-
+        val hosters = getCachedVideos(episode.url)
+            .mapNotNull { video ->
+                val serverName = video.videoTitle.substringAfterLast(" · ").trim()
+                if (serverName !in LINK_TYPE_ENTRIES) return@mapNotNull null
+                Hoster(hosterName = serverName, hosterUrl = "${episode.url}#server=$serverName")
+            }
+            .distinctBy { it.hosterName.lowercase(Locale.ROOT) }
         val prefLinkType = preferences.getString(PREF_LINK_TYPE_KEY, PREF_LINK_TYPE_DEFAULT) ?: PREF_LINK_TYPE_DEFAULT
         return hosters.sortedByDescending { it.hosterName.equals(prefLinkType, ignoreCase = true) }
     }
@@ -591,12 +616,12 @@ class AV1Encodes : Source() {
     override suspend fun getVideoList(hoster: Hoster): List<Video> {
         val serverName = hoster.hosterName
         val episodeUrl = hoster.hosterUrl.substringBefore("#server=")
-        val allVideos = extractAllVideos(episodeUrl)
-        val filtered = allVideos.filter { it.videoTitle.contains(serverName, ignoreCase = true) }
-        return if (filtered.isNotEmpty()) filtered else allVideos
+        return getCachedVideos(episodeUrl)
+            .filter { it.videoTitle.substringAfterLast(" · ").trim().equals(serverName, ignoreCase = true) }
+            .sortVideos()
     }
 
-    override suspend fun getVideoList(episode: SEpisode): List<Video> = extractAllVideos(episode.url).sortVideos()
+    override suspend fun getVideoList(episode: SEpisode): List<Video> = getCachedVideos(episode.url).sortVideos()
 
     private suspend fun extractAllVideos(episodeUrl: String): List<Video> {
         Log.d(TAG, "extractAllVideos: episodeUrl=${episodeUrl.substringBefore("?")}")
@@ -613,11 +638,9 @@ class AV1Encodes : Source() {
         var downloadPageUrl = if (episodeUrl.startsWith("http")) episodeUrl else baseUrl + episodeUrl
 
         var pageHtml = try {
-            client.newCall(
-                GET(downloadPageUrl, headers.newBuilder().set("Referer", "$baseUrl/").build()),
-            ).awaitSuccess().bodyString()
+            fetchTextWithRetry(downloadPageUrl, headers.newBuilder().set("Referer", "$baseUrl/").build())
         } catch (e: Exception) {
-            Log.e(TAG, "extractAllVideos: initial download page failed — ${e.message}")
+            Log.e(TAG, "extractAllVideos: initial download page failed (${e.javaClass.simpleName})")
             ""
         }
 
@@ -647,11 +670,9 @@ class AV1Encodes : Source() {
                     downloadPageUrl = if (freshLink.startsWith("http")) freshLink else baseUrl + freshLink
                     Log.d(TAG, "extractAllVideos: refreshed download URL from episode list")
                     pageHtml = try {
-                        client.newCall(
-                            GET(downloadPageUrl, headers.newBuilder().set("Referer", "$baseUrl/").build()),
-                        ).awaitSuccess().bodyString()
+                        fetchTextWithRetry(downloadPageUrl, headers.newBuilder().set("Referer", "$baseUrl/").build())
                     } catch (e: Exception) {
-                        Log.e(TAG, "extractAllVideos: fresh download page failed — ${e.message}")
+                        Log.e(TAG, "extractAllVideos: fresh download page failed (${e.javaClass.simpleName})")
                         ""
                     }
                     ddlToken = extractDdlToken(pageHtml)
@@ -695,11 +716,9 @@ class AV1Encodes : Source() {
                 if (freshDownloadUrl != downloadPageUrl) {
                     downloadPageUrl = freshDownloadUrl
                     pageHtml = try {
-                        client.newCall(
-                            GET(downloadPageUrl, headers.newBuilder().set("Referer", "$baseUrl/").build()),
-                        ).awaitSuccess().bodyString()
+                        fetchTextWithRetry(downloadPageUrl, headers.newBuilder().set("Referer", "$baseUrl/").build())
                     } catch (e: Exception) {
-                        Log.e(TAG, "extractAllVideos: refreshed download page failed — ${e.message}")
+                        Log.e(TAG, "extractAllVideos: refreshed download page failed (${e.javaClass.simpleName})")
                         ""
                     }
                     ddlToken = extractDdlToken(pageHtml)
@@ -716,32 +735,18 @@ class AV1Encodes : Source() {
             val qualLabel = "AV1 · $resLabel$audioSuffix$sizeLabel"
             val vHeaders = getVideoHeaders()
 
-            val resolvedStream = resolveRedirect(ddl.streamLink)
-            val resolvedWatch = resolveRedirect(ddl.watchLink)
-            val resolvedDl = resolveRedirect(ddl.downloadLink ?: ddl.ddl)
-            val primaryCdnUrl = resolvedStream ?: resolvedWatch ?: resolvedDl
-
-            if (primaryCdnUrl != null) {
-                val dlUrl = toDlUrl(resolvedDl ?: primaryCdnUrl, ext)
-                val streamUrl = toStreamUrl(resolvedStream ?: primaryCdnUrl, ext)
-
-                Log.d(TAG, "extractAllVideos: resolved Direct DL link")
-                videos.add(Video(videoUrl = dlUrl, videoTitle = "$qualLabel · Direct DL", headers = vHeaders))
-
-                Log.d(TAG, "extractAllVideos: resolved Stream link")
-                videos.add(Video(videoUrl = streamUrl, videoTitle = "$qualLabel · Stream", headers = vHeaders))
+            val candidates = listOf(
+                ddl.streamLink to "Stream",
+                ddl.watchLink to "Stream",
+                ddl.downloadLink to "Direct DL",
+                ddl.ddl to "Direct DL",
+            )
+            for ((rawUrl, expectedServer) in candidates) {
+                val resolvedUrl = resolveRedirect(rawUrl) ?: continue
+                val video = buildVideo(resolvedUrl, expectedServer, qualLabel, ext, vHeaders) ?: continue
+                if (videos.none { it.videoUrl == video.videoUrl }) videos.add(video)
             }
-
-            if (preferences.getBoolean(PREF_SHOW_TORRENT_KEY, PREF_SHOW_TORRENT_DEFAULT)) {
-                val rawTorrent = ddl.torrentLink
-                if (!rawTorrent.isNullOrBlank()) {
-                    val torrentUrl = if (rawTorrent.startsWith("magnet:")) rawTorrent else resolveRedirect(rawTorrent)
-                    if (torrentUrl != null) {
-                        Log.d(TAG, "extractAllVideos: resolved torrent link")
-                        videos.add(Video(videoUrl = torrentUrl, videoTitle = "$qualLabel · Torrent", headers = vHeaders))
-                    }
-                }
-            }
+            // Torrent/magnet URIs are not HTTP media streams and must not be offered as playable Video URLs.
         }
 
         // If no videos yet, check if page has direct video player iframe or fallback links
@@ -760,13 +765,9 @@ class AV1Encodes : Source() {
             }
 
             if (!rawLink.isNullOrBlank()) {
-                val resolved = resolveRedirect(rawLink) ?: rawLink
-                if (resolved.contains("/stream/") || resolved.contains("/watch/") || resolved.contains("/dash/") || resolved.contains("/dl/")) {
-                    val dlUrl = toDlUrl(resolved, ext)
-                    val streamUrl = toStreamUrl(resolved, ext)
-                    videos.add(Video(videoUrl = dlUrl, videoTitle = "$qualLabel · Direct DL", headers = vHeaders))
-                    videos.add(Video(videoUrl = streamUrl, videoTitle = "$qualLabel · Stream", headers = vHeaders))
-                }
+                val resolved = resolveRedirect(rawLink)
+                val video = resolved?.let { buildVideo(it, "Stream", qualLabel, ext, vHeaders) }
+                if (video != null) videos.add(video)
             }
         }
 
@@ -774,15 +775,80 @@ class AV1Encodes : Source() {
         return videos
     }
 
+    private suspend fun fetchTextWithRetry(url: String, requestHeaders: Headers): String =
+        retryTransientIo {
+            getResponseWithRetry(client, url, requestHeaders).use { response ->
+                if (!response.isSuccessful) throw IllegalStateException("HTTP ${response.code}")
+                response.bodyString()
+            }
+        }
+
+    private suspend fun <T> retryTransientIo(block: suspend () -> T): T {
+        var retries = 0
+        while (true) {
+            try {
+                return block()
+            } catch (e: IOException) {
+                if (retries >= MAX_NETWORK_RETRIES) throw e
+                delay(RETRY_BASE_DELAY_MS * (retries + 1))
+                retries++
+            }
+        }
+    }
+
+    private suspend fun getResponseWithRetry(
+        requestClient: OkHttpClient,
+        url: String,
+        requestHeaders: Headers,
+    ): Response {
+        var retries = 0
+        while (true) {
+            val response = retryTransientIo {
+                requestClient.newCall(GET(url, requestHeaders)).await()
+            }
+            if (response.code !in 500..599 || retries >= MAX_NETWORK_RETRIES) return response
+            response.close()
+            delay(RETRY_BASE_DELAY_MS * (retries + 1))
+            retries++
+        }
+    }
+
+    private fun buildVideo(
+        url: String,
+        expectedServer: String,
+        qualLabel: String,
+        ext: String,
+        headers: Headers,
+    ): Video? {
+        if (!url.startsWith("http://", ignoreCase = true) && !url.startsWith("https://", ignoreCase = true)) return null
+
+        val path = runCatching { url.toHttpUrl().encodedPath }.getOrDefault(url.substringBefore("#").substringBefore("?"))
+        if (path.endsWith(".torrent", ignoreCase = true)) return null
+
+        val serverName = when {
+            path.contains("/dash/", ignoreCase = true) || path.endsWith(".mpd", ignoreCase = true) -> "Dash"
+            path.contains("/stream/", ignoreCase = true) -> "Stream"
+            path.contains("/dl/", ignoreCase = true) -> "Direct DL"
+            else -> expectedServer
+        }
+        if (serverName !in LINK_TYPE_ENTRIES) return null
+
+        val videoUrl = when (serverName) {
+            "Dash" -> sanitizeCdnDomain(url)
+            "Stream" -> toStreamUrl(url, ext)
+            "Direct DL" -> toDlUrl(url, ext)
+            else -> return null
+        }
+        return Video(videoUrl = videoUrl, videoTitle = "$qualLabel · $serverName", headers = headers)
+    }
+
     private suspend fun fetchEpisodePage(slug: String, season: String, resSegment: String): String {
         val epPageUrl = "$baseUrl/episodes/$slug/$season/$resSegment"
         Log.d(TAG, "extractAllVideos: refreshing episode data from $epPageUrl")
         return try {
-            client.newCall(
-                GET(epPageUrl, headers.newBuilder().set("Referer", "$baseUrl/anime/$slug").build()),
-            ).awaitSuccess().bodyString()
+            fetchTextWithRetry(epPageUrl, headers.newBuilder().set("Referer", "$baseUrl/anime/$slug").build())
         } catch (e: Exception) {
-            Log.e(TAG, "extractAllVideos: episode data refresh failed — ${e.message}")
+            Log.e(TAG, "extractAllVideos: episode data refresh failed (${e.javaClass.simpleName})")
             ""
         }
     }
@@ -791,21 +857,19 @@ class AV1Encodes : Source() {
         val ddlUrl = "$baseUrl/get_ddl/$encodedFilename"
         Log.d(TAG, "extractAllVideos: calling get_ddl (token present)")
         val ddlRaw = try {
-            client.newCall(
-                GET(
-                    ddlUrl,
-                    headers.newBuilder()
-                        .set("Accept", "application/json")
-                        .set("Referer", referer)
-                        .set("Sec-Fetch-Dest", "empty")
-                        .set("Sec-Fetch-Mode", "cors")
-                        .set("Sec-Fetch-Site", "same-origin")
-                        .set("X-DDL-Token", token)
-                        .build(),
-                ),
-            ).awaitSuccess().bodyString()
+            fetchTextWithRetry(
+                ddlUrl,
+                headers.newBuilder()
+                    .set("Accept", "application/json")
+                    .set("Referer", referer)
+                    .set("Sec-Fetch-Dest", "empty")
+                    .set("Sec-Fetch-Mode", "cors")
+                    .set("Sec-Fetch-Site", "same-origin")
+                    .set("X-DDL-Token", token)
+                    .build(),
+            )
         } catch (e: Exception) {
-            Log.e(TAG, "extractAllVideos: get_ddl failed — ${e.message}")
+            Log.e(TAG, "extractAllVideos: get_ddl failed (${e.javaClass.simpleName})")
             return null
         }
         return runCatching { ddlRaw.parseAs<DdlResponse>() }
@@ -829,55 +893,119 @@ class AV1Encodes : Source() {
     }
 
     private suspend fun resolveRedirect(path: String?, depth: Int = 0): String? {
-        if (path.isNullOrBlank() || depth > 3) return null
-        val target = if (path.startsWith("/")) "$baseUrl$path" else path
+        if (path.isNullOrBlank() || depth > MAX_REDIRECT_DEPTH || path.startsWith("magnet:", ignoreCase = true)) return null
+        val target = when {
+            path.startsWith("http://", ignoreCase = true) || path.startsWith("https://", ignoreCase = true) -> path
+            path.startsWith("//") -> "${baseUrl.toHttpUrl().scheme}:$path"
+            path.startsWith("/") -> "$baseUrl$path"
+            else -> "$baseUrl/${path.trimStart('/')}"
+        }
         return try {
-            noRedirectClient.newCall(
-                GET(
+            retryTransientIo {
+                getResponseWithRetry(
+                    noRedirectClient,
                     target,
                     headers.newBuilder()
                         .set("Referer", "$baseUrl/")
                         .set("Sec-Fetch-Site", "same-origin")
                         .build(),
-                ),
-            ).await().use { resp ->
-                val loc = resp.header("Location")
-                when {
-                    !loc.isNullOrBlank() -> {
-                        val nextUrl = if (loc.startsWith("/")) "$baseUrl$loc" else loc
-                        val cleanNext = sanitizeCdnDomain(nextUrl)
-                        if (cleanNext.contains("/r/")) resolveRedirect(cleanNext, depth + 1) else cleanNext
+                ).use { resp ->
+                    val location = resp.header("Location")
+                    if (!location.isNullOrBlank()) {
+                        val nextUrl = resp.request.url.resolve(location)?.toString() ?: return@use null
+                        return@use resolveRedirect(sanitizeCdnDomain(nextUrl), depth + 1)
                     }
 
-                    resp.isSuccessful -> sanitizeCdnDomain(resp.request.url.toString())
+                    if (!resp.isSuccessful) return@use null
 
-                    else -> null
+                    val finalUrl = sanitizeCdnDomain(resp.request.url.toString())
+                    val contentType = resp.header("Content-Type").orEmpty().substringBefore(";").lowercase(Locale.ROOT)
+                    val finalPath = resp.request.url.encodedPath
+                    if (isPlayableMediaResponse(contentType, finalPath)) return@use finalUrl
+
+                    if (contentType.contains("html") || contentType.contains("xhtml")) {
+                        val html = resp.body?.string().orEmpty()
+                        for (mediaUrl in extractEmbeddedMediaUrls(html, finalUrl)) {
+                            val resolved = resolveRedirect(mediaUrl, depth + 1)
+                            if (resolved != null) return@use resolved
+                        }
+                    }
+                    null
                 }
             }
         } catch (e: Exception) {
-            Log.e(TAG, "resolveRedirect failed for ${path.substringBefore("?")}: ${e.message}")
+            Log.e(TAG, "resolveRedirect failed for ${path.substringBefore("?")} (${e.javaClass.simpleName})")
             null
         }
     }
 
-    private fun sanitizeCdnDomain(url: String): String = url.replace("animealpha.cc", "av1encodes.com")
-
-    private fun toStreamUrl(url: String, ext: String = ".mkv"): String {
-        val clean = sanitizeCdnDomain(url)
-            .replace("/watch/", "/stream/")
-            .replace("/dl/", "/stream/")
-            .replace("/dash/", "/stream/")
-            .substringBefore("/manifest.mpd")
-        return if (clean.contains("#")) clean else "$clean#$ext"
+    private fun isPlayableMediaResponse(contentType: String, path: String): Boolean {
+        if (path.endsWith(".torrent", ignoreCase = true)) return false
+        if (contentType.contains("text/html") || contentType.contains("application/json")) return false
+        if (
+            contentType.startsWith("video/") ||
+            contentType in setOf(
+                "application/dash+xml",
+                "application/vnd.apple.mpegurl",
+                "application/x-mpegurl",
+                "application/mpegurl",
+                "application/mp4",
+                "application/octet-stream",
+            )
+        ) {
+            return true
+        }
+        return Regex("""\.(?:mpd|m3u8|mp4|mkv|webm|ts)$""", RegexOption.IGNORE_CASE)
+            .containsMatchIn(path)
     }
 
-    private fun toDlUrl(url: String, ext: String = ".mkv"): String {
-        val clean = sanitizeCdnDomain(url)
-            .replace("/watch/", "/dl/")
-            .replace("/stream/", "/dl/")
-            .replace("/dash/", "/dl/")
-            .substringBefore("/manifest.mpd")
-        return if (clean.contains("#")) clean else "$clean#$ext"
+    private fun extractEmbeddedMediaUrls(html: String, pageUrl: String): List<String> {
+        val selectors = listOf(
+            "video[src]",
+            "video[data-src]",
+            "video source[src]",
+            "video source[data-src]",
+            "source[src]",
+            "source[data-src]",
+            "iframe[src*='dash']",
+            "iframe[src*='stream']",
+            "iframe[src*='watch']",
+            "iframe[src*='player']",
+            "iframe[src*='video']",
+            "iframe[data-src]",
+            "iframe[id*='player'][src]",
+            "a[download][href]",
+            "a[href*='/download/']",
+            "a[href*='/dash/']",
+            "a[href*='/stream/']",
+            "a[href*='/dl/']",
+            "a[href*='/r/']",
+            "a[href$='.mp4']",
+            "a[href$='.mkv']",
+            "a[href$='.m3u8']",
+        )
+        val document = Jsoup.parse(html, pageUrl)
+        return document.select(selectors.joinToString(","))
+            .mapNotNull { element ->
+                listOf("abs:src", "abs:data-src", "abs:href")
+                    .firstNotNullOfOrNull { attribute -> element.attr(attribute).takeIf(String::isNotBlank) }
+            }
+            .distinct()
+    }
+
+    private fun sanitizeCdnDomain(url: String): String = url.replace("animealpha.cc", "av1encodes.com")
+
+    private fun toStreamUrl(url: String, ext: String = ".mkv"): String =
+        addContainerHint(sanitizeCdnDomain(url).replace("/watch/", "/stream/"), ext)
+
+    private fun toDlUrl(url: String, ext: String = ".mkv"): String =
+        addContainerHint(sanitizeCdnDomain(url), ext)
+
+    private fun addContainerHint(url: String, ext: String): String {
+        val path = url.substringBefore("#").substringBefore("?")
+        val hasMediaExtension = Regex("""\.(?:mpd|m3u8|mp4|mkv|webm|ts)$""", RegexOption.IGNORE_CASE)
+            .containsMatchIn(path)
+        return if (hasMediaExtension || url.contains("#")) url else "$url#$ext"
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -1014,6 +1142,11 @@ class AV1Encodes : Source() {
 
     companion object {
         private const val TAG = "AV1Encodes"
+        private const val MAX_NETWORK_RETRIES = 2
+        private const val RETRY_BASE_DELAY_MS = 300L
+        private const val MAX_REDIRECT_DEPTH = 3
+        private const val VIDEO_CACHE_TTL_MS = 30_000L
+        private const val MAX_VIDEO_CACHE_SIZE = 48
         private const val DESKTOP_UA =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     }
