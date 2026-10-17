@@ -775,13 +775,12 @@ class AV1Encodes : Source() {
         return videos
     }
 
-    private suspend fun fetchTextWithRetry(url: String, requestHeaders: Headers): String =
-        retryTransientIo {
-            getResponseWithRetry(client, url, requestHeaders).use { response ->
-                if (!response.isSuccessful) throw IllegalStateException("HTTP ${response.code}")
-                response.bodyString()
-            }
+    private suspend fun fetchTextWithRetry(url: String, requestHeaders: Headers): String = retryTransientIo {
+        getResponseWithRetry(client, url, requestHeaders).use { response ->
+            if (!response.isSuccessful) throw IllegalStateException("HTTP ${response.code}")
+            response.bodyString()
         }
+    }
 
     private suspend fun <T> retryTransientIo(block: suspend () -> T): T {
         var retries = 0
@@ -995,11 +994,9 @@ class AV1Encodes : Source() {
 
     private fun sanitizeCdnDomain(url: String): String = url.replace("animealpha.cc", "av1encodes.com")
 
-    private fun toStreamUrl(url: String, ext: String = ".mkv"): String =
-        addContainerHint(sanitizeCdnDomain(url).replace("/watch/", "/stream/"), ext)
+    private fun toStreamUrl(url: String, ext: String = ".mkv"): String = addContainerHint(sanitizeCdnDomain(url).replace("/watch/", "/stream/"), ext)
 
-    private fun toDlUrl(url: String, ext: String = ".mkv"): String =
-        addContainerHint(sanitizeCdnDomain(url), ext)
+    private fun toDlUrl(url: String, ext: String = ".mkv"): String = addContainerHint(sanitizeCdnDomain(url), ext)
 
     private fun addContainerHint(url: String, ext: String): String {
         val path = url.substringBefore("#").substringBefore("?")
